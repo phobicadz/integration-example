@@ -29,19 +29,17 @@ Import-Module Az.Accounts -ErrorAction Stop
 $rgName        = 'Fanny'
 $identityName  = 'id-integration-example-ci'
 $githubRepo    = 'phobicadz/integration-example'
-# The subject claim GitHub actually presents is what has to match. azure/login prints it
-# in its failure line (AADSTS700213 'No matching federated identity record found for
-# presented assertion subject …'), and on this repo it came out as:
+# The subject claim GitHub actually presents is what has to match, exactly. azure/login
+# prints it when it fails (AADSTS700213 'No matching federated identity record found for
+# presented assertion subject …' + a 'subject claim - …' line), and on this repo it is:
 #   repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main
 # i.e. with the owner and repository ids embedded. The `repo:org/repo:*` wildcard forms
-# (both spellings) never matched it; registering the exact claim string is what worked.
-# All four are registered so the run goes green first - then delete the ones that never
-# matched and keep just the exact subject.
+# (both spellings) never matched; the exact claim is what made the login succeed, so only
+# exact ref-scoped subjects are trusted here. Re-run this script after any rename or
+# branch-policy change and read the new claim out of the action log.
 $githubSubjects = @(
     'repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main',
-    "repo:${githubRepo}:ref:refs/heads/main",
-    "repo:${githubRepo}:*",
-    'repo:phobicadz@1702616/integration-example@1423810732:*'
+    "repo:${githubRepo}:ref:refs/heads/main"
 )
 $githubIssuer  = 'https://token.actions.githubusercontent.com'
 $functionAppName = 'prodint-fn-wrkc7gwtmfswq'
@@ -127,6 +125,13 @@ foreach ($subject in $githubSubjects) {
     Write-Host "      name    : $credName"
 }
 Write-Host "      issuer  : $githubIssuer (audience: api://AzureADTokenExchange)"
+
+# Declarative cleanup: this identity should trust exactly the subjects listed above, so
+# anything left over (an old wildcard, a renamed repo) is removed.
+foreach ($stale in ($existingCreds | Where-Object { $githubSubjects -notcontains $_.properties.subject })) {
+    $del = Invoke-AzRestMethod -Path "$identityId/federatedIdentityCredentials/$($stale.name)?api-version=$apiIdentity" -Method DELETE
+    Write-Host "      removed stale subject '$($stale.properties.subject)' (HTTP $($del.StatusCode))"
+}
 
 # --- 3. role assignments --------------------------------------------------------------
 $app = Invoke-AzRestMethod -Path "$rgId/providers/Microsoft.Web/sites/${functionAppName}?api-version=$apiWeb" -Method GET
