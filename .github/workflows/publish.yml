@@ -200,5 +200,7 @@ jobs:
         run: |
           correlation="gha-${GITHUB_SHA::8}-$(date -u +%H%M%S)"
           echo "Correlation id for this run: $correlation"
-          ./scripts/smoke-test.sh "https://${{ needs.deploy.outputs.host }}" "$correlation" \
+          # invoked through bash on purpose: the executable bit is not reliably carried
+          # through a Windows checkout, and `bash file.sh` works either way.
+          bash scripts/smoke-test.sh "https://${{ needs.deploy.outputs.host }}" "$correlation" \
             | tee "$GITHUB_STEP_SUMMARY"

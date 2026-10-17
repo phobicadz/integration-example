@@ -33,9 +33,13 @@ $githubRepo    = 'phobicadz/integration-example'
 # in its failure line (AADSTS700213 'No matching federated identity record found for
 # presented assertion subject …'), and on this repo it came out as:
 #   repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main
-# i.e. with the owner and repository ids embedded. Both spellings are registered below so
-# either form works; delete the one that never matches once you have a green run.
+# i.e. with the owner and repository ids embedded. The `repo:org/repo:*` wildcard forms
+# (both spellings) never matched it; registering the exact claim string is what worked.
+# All four are registered so the run goes green first - then delete the ones that never
+# matched and keep just the exact subject.
 $githubSubjects = @(
+    'repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main',
+    "repo:${githubRepo}:ref:refs/heads/main",
     "repo:${githubRepo}:*",
     'repo:phobicadz@1702616/integration-example@1423810732:*'
 )

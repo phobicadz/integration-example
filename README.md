@@ -448,7 +448,9 @@ POLL_MAX_ATTEMPTS=60 ./scripts/smoke-test.sh https://<app>.azurewebsites.net   #
 ```
 
 It needs `curl` and `jq`, exits non-zero at the first broken assumption, and prints the run
-summary (ids + counts) so a failing CI run is readable without extra digging.
+summary (ids + counts) so a failing CI run is readable without extra digging. The workflow
+calls it as `bash scripts/smoke-test.sh …` because a Windows checkout does not always keep
+the executable bit (exit 126, “Permission denied”).
 
 ## Project layout
 
@@ -517,10 +519,10 @@ src/ProductIntegration/
 - OIDC subject matching is exact. If `azure/login` fails with
   `AADSTS700213: No matching federated identity record found for presented assertion
   subject …`, read the **presented** subject out of the action's own log (it prints
-  “subject claim - …”) and register that spelling. On this repo GitHub presented
-  `repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main` — ids
-  embedded — so `setup-github-oidc.ps1` trusts both forms (an identity may hold several
-  federated credentials; each holds exactly one audience).
+  “subject claim - …”) and register that exact string. On this repo GitHub presented
+  `repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main` — owner and
+  repository ids embedded — and the `repo:org/repo:*` wildcard forms (both spellings) did
+  **not** match it; registering the exact claim is what made the login succeed.
 - ARM gotchas hit while writing `infra/setup-github-oidc.ps1`:
   - `roleDefinitionId` in a role-assignment PUT must be the **full role-definition resource
     id**; a bare GUID fails with `BadRequestFormat` / `InvalidResourceType`.
