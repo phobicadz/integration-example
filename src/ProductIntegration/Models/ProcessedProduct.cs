@@ -35,4 +35,12 @@ public record ProcessedProduct
 
     [JsonPropertyName("processedAtUtc")]
     public DateTimeOffset ProcessedAtUtc { get; init; }
+
+    /// <summary>
+    /// Which integration run delivered this record — the destination keeps the
+    /// correlation id so a downstream problem can be traced back to the exact run
+    /// and its log lines. In a real system this is a column / message property.
+    /// </summary>
+    [JsonPropertyName("correlationId")]
+    public string CorrelationId { get; init; } = "";
 }

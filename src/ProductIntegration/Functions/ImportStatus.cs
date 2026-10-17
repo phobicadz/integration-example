@@ -1,9 +1,11 @@
 using System.Net;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
 using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
 using ProductIntegration.Models;
+using ProductIntegration;
 
 namespace ProductIntegration.Functions;
 
@@ -19,7 +21,8 @@ public class ImportStatus
     public async Task<HttpResponseData> Run(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "products/import/{id}/status")] HttpRequestData req,
         [DurableClient] DurableTaskClient client,
-        string id)
+        string id,
+        FunctionContext executionContext)
     {
         // getInputsAndOutputs: true also fetches the serialized input/output payloads.
         OrchestrationMetadata? metadata =
@@ -32,12 +35,26 @@ public class ImportStatus
             return notFound;
         }
 
+        // The correlation id the run was started with: read it from the orchestration
+        // input so it is available even while the run is still in progress.
+        string? correlationId = null;
+        try { correlationId = metadata.ReadInputAs<IntegrationRequest>()?.CorrelationId; } catch { /* older payload */ }
+        correlationId = Correlation.ForRun(correlationId, metadata.InstanceId);
+
         // The orchestrator's return value: an IntegrationSummary once finished.
         IntegrationSummary? summary = null;
         if (metadata.RuntimeStatus == OrchestrationRuntimeStatus.Completed)
         {
             try { summary = metadata.ReadOutputAs<IntegrationSummary>(); } catch { /* older payload */ }
+            // Prefer the summary's value when present (it is the authoritative one).
+            if (!string.IsNullOrWhiteSpace(summary?.CorrelationId)) correlationId = summary!.CorrelationId;
         }
+
+        // Logging the RUN's correlation id here means one grep on that id also finds
+        // every status poll made against this run, not just the run's own log lines.
+        executionContext.GetLogger(nameof(ImportStatus))
+            .LogInformation("[corr:{RunCorrelationId}] status requested for run {RunId} (status={Status})",
+                correlationId, metadata.InstanceId, metadata.RuntimeStatus);
 
         // The event history is the audit trail: every task scheduled/completed,
         // retries, timers... Some backends don't support it, so guard the call.
@@ -57,6 +74,7 @@ public class ImportStatus
         await response.WriteAsJsonAsync(new
         {
             runId = metadata.InstanceId,
+            correlationId,
             name = metadata.Name,
             runtimeStatus = metadata.RuntimeStatus.ToString(),
             isRunning = metadata.IsRunning,

@@ -54,7 +54,17 @@ POST /api/products/import
    ```powershell
    Invoke-WebRequest -Uri http://localhost:7071/api/products/import -Method Post `
      -ContentType 'application/json' -Body '{"category":null}'
-   # → 202 Accepted, body contains runId + statusUrl, header Retry-After: 5
+   # → 202 Accepted, body contains runId + correlationId + statusUrl, header Retry-After: 5
+   ```
+
+   Optionally supply your own correlation id (recommended when you call this from a
+   system that already has one — it is what lets you stitch logs across services):
+   ```powershell
+   Invoke-WebRequest -Uri http://localhost:7071/api/products/import -Method Post `
+     -ContentType 'application/json' -Headers @{ 'x-correlation-id' = "my-run-42" } `
+     -Body '{"category":null}'
+   # or a W3C trace header instead:  -Headers @{ 'traceparent' = "00-4bf9ef7e92de95c3cf1f4bfcbb90ba96-00f0000000000001-01" }
+   # → that id comes back in the x-correlation-id response header and in every log line
    ```
 5. **Poll the status endpoint** until `runtimeStatus` is `Completed` / `Failed`:
    ```powershell
@@ -159,20 +169,60 @@ Real-world equivalents of the same guard:
 | HTTP APIs | `If-Match` / `ETag`, or an idempotency-key header |
 | Event-sourced systems | sequence number / vector clock per aggregate |
 
+### 6. Correlation ids (trace one run end to end)
+
+Two ids, two jobs — both are threaded through the whole run:
+
+| Id | Where it comes from | What it identifies |
+|---|---|---|
+| `runId` | the Durable Functions **orchestration instance id** | one run of the workflow (queryable via the status endpoint + history) |
+| `correlationId` | the **caller**: `x-correlation-id` header, else the trace-id of a W3C `traceparent` header, else the ambient `Activity`, else a new GUID | one logical request, correlatable with the calling system's own logs |
+
+```csharp
+// ImportTrigger: the id is created at the edge, once
+string correlationId = Correlation.Resolve(req);            // honours the caller's id
+// ProductImportOrchestrator: it is *carried* in the (replayable) orchestration input
+string correlationId = Correlation.ForRun(request?.CorrelationId, context.InstanceId);
+```
+
+Where it shows up:
+
+- **HTTP**: `x-correlation-id` on every response (set in one place, `CorrelationMiddleware`),
+  and `correlationId` in the JSON body of the 202 response, the status response and the
+  destination dump.
+- **Activity payloads**: `IntegrationRequest` → `FetchRequest` / `ItemWorkItem` carry it into
+  every activity, so side effects are attributable even though they run on another process.
+- **Logs**: every line is prefixed `[corr:{CorrelationId}]`, and `Correlation.BeginLogScope`
+  also adds `correlationId` + `runId` as *structured* properties, so in Application Insights
+  you can query `customDimensions.correlationId` instead of grepping text.
+- **The destination**: `ProcessedProduct.CorrelationId` records *which run wrote this record*
+  (the CAS guard keeps the original winner, so it stays the id of the run that actually applied it).
+
+The one rule that matters: **never generate a correlation id inside an orchestrator.**
+`Guid.NewGuid()` in orchestration code breaks determinism and replay. Orchestrators derive
+the id from their input (or fall back to the instance id, which is stable per run).
+
+Real-world equivalents: API Management / Application Gateway forward a `traceparent`;
+Service Bus messages have `CorrelationId`; Application Insights ties everything together with
+`Operation_Id` — which is exactly the trace-id this project reads and re-emits.
+
 ## Monitoring this integration
 
 | Signal | Where | What it tells you |
 |---|---|---|
-| Run status | `GET /api/products/import/{id}/status` | `runtimeStatus` (Running/Completed/Failed/Terminated), created/updated timestamps, failure details, final summary |
+| Run status | `GET /api/products/import/{id}/status` | `runtimeStatus` (Running/Completed/Failed/Terminated), created/updated timestamps, failure details, final summary, and the run's `correlationId` |
 | Audit trail | same endpoint, `history` field (`client.GetOrchestrationHistoryAsync`) | every event: each task scheduled/completed, retries, timers — replay this and you can reconstruct exactly how the run progressed |
 | Destination check | `GET /api/products/destination` | what actually arrived downstream (the integration's real output) |
-| Structured logs | `ILogger` in activities/trigger → console locally, **Application Insights** in prod (`AddApplicationInsightsTelemetryWorkerService().ConfigureFunctionsApplicationInsights()` is already wired in `Program.cs`) | per-item POSTED/REJECTED/FAILED lines, correlation via `[run:{RunId}]` in every message |
+| Structured logs | `ILogger` in activities/trigger → console locally, **Application Insights** in prod (`AddApplicationInsightsTelemetryWorkerService().ConfigureFunctionsApplicationInsights()` is already wired in `Program.cs`) | per-item POSTED/REJECTED/FAILED lines, correlation via `[corr:{CorrelationId}]` in every message plus `correlationId`/`runId` log-scope properties (queryable as `customDimensions`) |
 | Instance inventory | `client.GetAllInstancesAsync(new OrchestrationQuery { ... })` | list/paginate all runs by status or time window — build a dashboard endpoint from this |
 | **DTS dashboard** | http://localhost:8082 (emulator) or the task hub's dashboard URL in Azure | live orchestration inventory per task hub: running/completed/failed counts, per-instance drill-down into event history — no code required |
 | Production dashboards | Application Insights (Functions app maps, end-to-end transactions) and **Durable Task Scheduler** (for the DTS backend) | orchestration-level metrics, failure rates, alerting |
 
 Monitoring rules of thumb this demo encodes:
-- **Every run has an ID, and every log line carries it.** Correlation is the whole game.
+- **Every run has an ID, and every log line carries a correlation ID.** Correlation is the
+  whole game: `grep "corr:<your-id>"` over the console output (or a `customDimensions`
+  query in Application Insights) reproduces the entire run — trigger, fetch, every item,
+  and every status poll made against it.
 - **Status polling with `Retry-After`** is the client-facing monitoring contract for async integrations.
 - **A run that "completed" is not necessarily a successful integration** — the summary
   distinguishes posted/rejected/failed so partial success is visible, not hidden.
@@ -295,7 +345,9 @@ DTS Consumption SKU (pay-per-action, no base fee) — effectively near zero.
 
 ```
 src/ProductIntegration/
-├── Program.cs                      # host setup, DI, App Insights wiring
+├── Program.cs                      # host setup, DI, App Insights wiring, correlation middleware
+├── Correlation.cs                  # resolve/propagate correlation ids (x-correlation-id, traceparent)
+├── CorrelationMiddleware.cs        # per-request correlation: response header + request log lines
 ├── host.json                       # Functions host config + azureManaged (DTS) backend
 ├── local.settings.json             # Azurite + DTS_CONNECTION_STRING + TASKHUB_NAME
 ├── Models/                         # Product, ProcessedProduct (with Version), request/summary DTOs
@@ -331,3 +383,7 @@ src/ProductIntegration/
   to start an isolated project (it builds first and runs from the right output directory).
 - The status response's run id field is `runId` (not `id`) — poll
   `/api/products/import/{runId}/status`.
+- Correlation ids are **resolved at the HTTP edge only**. Generating one inside an
+  orchestrator (e.g. `Guid.NewGuid()`) breaks determinism: on replay the id would change,
+  so logs from the same run would no longer match. The orchestrator takes it from its
+  input and falls back to `context.InstanceId`.

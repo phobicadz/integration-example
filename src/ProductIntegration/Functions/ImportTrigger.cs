@@ -1,8 +1,10 @@
 using System.Net;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
 using Microsoft.DurableTask.Client;
 using ProductIntegration.Models;
+using ProductIntegration;
 
 namespace ProductIntegration.Functions;
 
@@ -18,19 +20,34 @@ public class ImportTrigger
     [Function("products-import")]
     public async Task<HttpResponseData> Run(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "products/import")] HttpRequestData req,
-        [DurableClient] DurableTaskClient client)
+        [DurableClient] DurableTaskClient client,
+        FunctionContext executionContext)
     {
+        ILogger logger = executionContext.GetLogger(nameof(ImportTrigger));
         var request = await TryReadRequestAsync(req);
 
+        // Correlation starts here, at the edge: honour the caller's x-correlation-id
+        // or traceparent trace-id, otherwise mint one and hand it back to the caller.
+        string correlationId = Correlation.Resolve(req);
+
         string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
-            nameof(ProductImportOrchestrator), new IntegrationRequest { Category = request?.Category });
+            nameof(ProductImportOrchestrator),
+            new IntegrationRequest { Category = request?.Category, CorrelationId = correlationId });
+
+        using (Correlation.BeginLogScope(logger, correlationId, instanceId))
+        {
+            logger.LogInformation("[corr:{CorrelationId}] run {InstanceId} scheduled (category={Category})",
+                correlationId, instanceId, request?.Category ?? "all");
+        }
 
         var response = req.CreateResponse(HttpStatusCode.Accepted);
         response.Headers.Add("Location", $"/api/products/import/{instanceId}/status");
         response.Headers.Add("Retry-After", "5");
+        // Note: the x-correlation-id response header is set once, in CorrelationMiddleware.
         await response.WriteAsJsonAsync(new
         {
             runId = instanceId,
+            correlationId,
             statusUrl = $"/api/products/import/{instanceId}/status",
             message = "Integration run started. Poll the statusUrl until the orchestration completes."
         });

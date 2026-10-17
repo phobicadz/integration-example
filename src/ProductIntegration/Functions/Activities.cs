@@ -2,6 +2,7 @@ using Microsoft.Azure.Functions.Worker;
 using Microsoft.DurableTask;
 using ProductIntegration.Models;
 using ProductIntegration.Services;
+using ProductIntegration;
 using Microsoft.Extensions.Logging;
 
 namespace ProductIntegration.Functions;
@@ -38,14 +39,16 @@ public class Activities
         [ActivityTrigger] FetchRequest request, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(FetchProducts));
-        logger.LogInformation("[run:{RunId}] Fetching products from mock source (category={Category})",
-            request.RunId, request.Category ?? "all");
+        using var _ = Correlation.BeginLogScope(logger, request.CorrelationId, request.RunId);
+
+        logger.LogInformation("[corr:{CorrelationId}] Fetching products from mock source (category={Category})",
+            request.CorrelationId, request.Category ?? "all");
 
         // A transient failure here is retried automatically by the durable runtime.
         var products = _source.Fetch(request.Category);
 
-        logger.LogInformation("[run:{RunId}] Fetched {Count} products from source",
-            request.RunId, products.Count);
+        logger.LogInformation("[corr:{CorrelationId}] Fetched {Count} products from source",
+            request.CorrelationId, products.Count);
 
         return Task.FromResult(products);
     }
@@ -61,6 +64,7 @@ public class Activities
         [ActivityTrigger] ItemWorkItem item, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger(nameof(ProcessAndPostProduct));
+        using var _ = Correlation.BeginLogScope(logger, item.CorrelationId, item.RunId);
         var product = item.Product;
 
         // --- Processing / validation step ---
@@ -83,13 +87,16 @@ public class Activities
             Version = product.Version,
             IsValid = issues.Count == 0,
             ValidationIssues = issues,
-            ProcessedAtUtc = DateTimeOffset.UtcNow
+            ProcessedAtUtc = DateTimeOffset.UtcNow,
+            // The destination record keeps the correlation id: downstream trouble can be
+            // traced back to the exact run (and its log lines / orchestration history).
+            CorrelationId = item.CorrelationId,
         };
 
         if (!processed.IsValid)
         {
-            logger.LogWarning("[run:{RunId}] REJECTED {Sku}: {Issues}",
-                item.RunId, product.Sku, string.Join("; ", issues));
+            logger.LogWarning("[corr:{CorrelationId}] REJECTED {Sku}: {Issues}",
+                item.CorrelationId, product.Sku, string.Join("; ", issues));
             return Task.FromResult(new ItemOutcome
             {
                 Sku = product.Sku,
@@ -108,8 +115,8 @@ public class Activities
                 // Destination already has an equal-or-newer version. Success, but counted
                 // as "skipped" — this is what a duplicate delivery / replay looks like
                 // against an idempotent destination.
-                logger.LogInformation("[run:{RunId}] SKIPPED {Sku} v{Version}: destination already current",
-                    item.RunId, processed.Sku, processed.Version);
+                logger.LogInformation("[corr:{CorrelationId}] SKIPPED {Sku} v{Version}: destination already current",
+                    item.CorrelationId, processed.Sku, processed.Version);
 
                 return Task.FromResult(new ItemOutcome
                 {
@@ -119,8 +126,8 @@ public class Activities
                 });
             }
 
-            logger.LogInformation("[run:{RunId}] POSTED {Sku} v{Version} to destination (wholesale={Price})",
-                item.RunId, processed.Sku, processed.Version, processed.WholesalePrice);
+            logger.LogInformation("[corr:{CorrelationId}] POSTED {Sku} v{Version} to destination (wholesale={Price})",
+                item.CorrelationId, processed.Sku, processed.Version, processed.WholesalePrice);
 
             return Task.FromResult(new ItemOutcome { Sku = processed.Sku, Success = true });
         }
@@ -128,7 +135,7 @@ public class Activities
         {
             // Throwing here triggers the RetryPolicy above; if all retries fail
             // the orchestrator records the item as failed and the run continues.
-            logger.LogError(ex, "[run:{RunId}] Failed to post {Sku}", item.RunId, processed.Sku);
+            logger.LogError(ex, "[corr:{CorrelationId}] Failed to post {Sku}", item.CorrelationId, processed.Sku);
             throw;
         }
     }
@@ -138,5 +145,6 @@ public class Activities
 public record FetchRequest
 {
     public string RunId { get; init; } = "";
+    public string CorrelationId { get; init; } = "";
     public string? Category { get; init; }
 }

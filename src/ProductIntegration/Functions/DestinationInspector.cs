@@ -1,6 +1,7 @@
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using ProductIntegration.Services;
+using ProductIntegration;
 
 namespace ProductIntegration.Functions;
 
@@ -19,9 +20,11 @@ public class DestinationInspector
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "products/destination")] HttpRequestData req)
     {
         var items = _destination.All();
+        var correlationId = Correlation.Resolve(req);
         var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
         await response.WriteAsJsonAsync(new
         {
+            correlationId,
             received = items.Count,
             items = items.OrderBy(i => i.Sku)
         });

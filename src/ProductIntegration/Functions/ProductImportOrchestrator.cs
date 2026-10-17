@@ -1,6 +1,7 @@
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.DurableTask;
 using ProductIntegration.Models;
+using ProductIntegration;
 
 namespace ProductIntegration.Functions;
 
@@ -37,27 +38,32 @@ public class ProductImportOrchestrator
         [OrchestrationTrigger] TaskOrchestrationContext context,
         IntegrationRequest? request)
     {
-        // A run id we thread through every activity for tracing/monitoring.
+        // Two ids, two jobs:
+        //  - runId         = this orchestration instance (identifies the run itself)
+        //  - correlationId = the caller's id, taken from the (replayable) input so it
+        //                    survives replays; falls back to the instance id.
+        // Never call Guid.NewGuid() here: orchestrators must stay deterministic.
         string runId = context.InstanceId;
+        string correlationId = Correlation.ForRun(request?.CorrelationId, context.InstanceId);
 
         // 1. FETCH: pull products from the mocked upstream endpoint.
         //    If the upstream is down the retry policy retries with backoff; if every
         //    attempt fails the whole run fails and the status endpoint surfaces it.
         var products = await context.CallActivityAsync<List<Product>>(
             nameof(Activities.FetchProducts),
-            new FetchRequest { RunId = runId, Category = request?.Category },
+            new FetchRequest { RunId = runId, CorrelationId = correlationId, Category = request?.Category },
             SourceRetryOptions);
 
         if (products is null || products.Count == 0)
         {
-            return new IntegrationSummary { RunId = runId, TotalFetched = 0 };
+            return new IntegrationSummary { RunId = runId, CorrelationId = correlationId, TotalFetched = 0 };
         }
 
         // 2. FAN-OUT: process + post each product.
         //    Each item is its own activity, so one bad item does not kill the run:
         //    we catch TaskFailedException per item and record it as "failed".
         var workItems = products
-            .Select(p => new ItemWorkItem { RunId = runId, Product = p })
+            .Select(p => new ItemWorkItem { RunId = runId, CorrelationId = correlationId, Product = p })
             .ToList();
 
         var outcomeTasks = workItems
@@ -79,6 +85,7 @@ public class ProductImportOrchestrator
         return new IntegrationSummary
         {
             RunId = runId,
+            CorrelationId = correlationId,
             TotalFetched = products.Count,
             Posted = outcomes.Count(o => o.Success && o.Reason != "skipped"),
             Skipped = outcomes.Count(o => o.Success && o.Reason == "skipped"),
