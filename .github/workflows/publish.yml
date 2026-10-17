@@ -95,8 +95,14 @@ jobs:
 
       # The workflow fails here with an actionable message instead of failing deep
       # inside azure/login with a confusing OIDC error.
+      # NOTE: repository variables are NOT environment variables — they only exist in the
+      # `vars` context, so a shell step has to be handed them via `env:` explicitly.
       - name: Preflight — required repository variables
         shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
         run: |
           missing=""
           for v in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do

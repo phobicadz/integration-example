@@ -505,6 +505,10 @@ src/ProductIntegration/
   orchestrator (e.g. `Guid.NewGuid()`) breaks determinism: on replay the id would change,
   so logs from the same run would no longer match. The orchestrator takes it from its
   input and falls back to `context.InstanceId`.
+- GitHub **repository variables are not environment variables**: a `run:` step only sees them
+  when they are mapped explicitly (`env: AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}`).
+  Secrets have the same trap. The `Preflight` step exists precisely because this fails
+  silently otherwise.
 - Pushing a file under `.github/workflows/` needs a token with the **`workflow`** scope;
   a `repo`-only PAT is rejected with *“refusing to allow a Personal Access Token to create
   or update workflow … without `workflow` scope”*.
