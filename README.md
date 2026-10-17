@@ -360,33 +360,48 @@ stays `infra/deploy.ps1`, which is a one-off and needs an interactive login).
 
 ### One-time setup (OIDC — no secrets to rotate)
 
-Run this in the Azure Cloud Shell (this machine has no `az` CLI) or click the equivalents in
-the portal:
+This machine has no `az` CLI, so the Azure side is scripted with Az PowerShell —
+`infra/setup-github-oidc.ps1` does all three steps and is **idempotent** (it re-PUTs the
+identity/credential and skips a role assignment that already exists):
+
+```powershell
+Import-Module Az.Accounts
+Connect-AzAccount
+. infra/setup-github-oidc.ps1     # dot-source, same rule as deploy.ps1
+#  [1/3] user-assigned identity 'id-integration-example-ci'   -> clientId + principalId
+#  [2/3] federated credential 'github-integration-example'    -> trusts this repo's OIDC token
+#  [3/3] role assignments                                     -> Contributor on the RG,
+#                                                               Website Contributor on the app
+#  then prints the exact values to put into GitHub
+```
+
+<details>
+<summary>Same thing with the az CLI (Cloud Shell / a machine that has it)</summary>
 
 ```bash
-SUB=e8f2b11f-4962-492a-afe2-8c465a22996f     # your subscription
-RG=Fanny                                      # the resource group deploy.ps1 created
-APP=prodint-fn-wrkc7gwtmfswq                 # from infra/deployment-outputs.json
-
-# 1. a user-assigned managed identity for CI
-az identity create -g $RG -n id-integration-example-ci -l northeurope
+SUB=…  RG=Fanny  APP=prodint-fn-…            # from infra/deployment-outputs.json
+az identity create -g $RG -n id-integration-example-ci -l uksouth
 CI_ID=$(az identity show -g $RG -n id-integration-example-ci --query clientId -o tsv)
 PRINCIPAL=$(az identity show -g $RG -n id-integration-example-ci --query principalId -o tsv)
 
-# 2. trust THIS GitHub repo (permissive: any ref). Narrow it later to
-#    "repo:phobicadz/integration-example:ref:refs/heads/main" if you want.
 az identity federated-credential create -g $RG --identity-name id-integration-example-ci \
   -n github-integration-example \
   --issuer "https://token.actions.githubusercontent.com" \
-  --subject "repo:phobicadz/integration-example:*"
+  --subject "repo:phobicadz/integration-example:*" \
+  --audiences "api://AzureADTokenExchange"
 
-# 3. permissions: Contributor on the group (app + its storage), Website Contributor on the app
 APP_ID=$(az functionapp show -n $APP -g $RG --query id -o tsv)
 az role assignment create --role Contributor           --assignee-object-id $PRINCIPAL \
   --assignee-principal-type ServicePrincipal --scope "/subscriptions/$SUB/resourceGroups/$RG"
 az role assignment create --role "Website Contributor" --assignee-object-id $PRINCIPAL \
   --assignee-principal-type ServicePrincipal --scope "$APP_ID"
 ```
+
+</details>
+
+The workflow's `azure/login` step pins `audience: api://AzureADTokenExchange`, which must be
+the **one and only** audience on the federated credential (ARM rejects more than one).
+
 
 Then in GitHub: **Settings → Secrets and variables → Actions → Variables** (Create a
 repository variable) and add:
@@ -402,6 +417,15 @@ repository variable) and add:
 If a variable is missing, the `deploy` job stops at its **Preflight** step naming exactly
 which one — that is the expected outcome of the *first* run right after pushing this
 workflow, before the variables exist.
+
+Variables can also be written from the CLI instead of the portal (a PAT with `repo` scope is
+enough):
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+  https://api.github.com/repos/phobicadz/integration-example/actions/variables \
+  -d '{"name":"AZURE_CLIENT_ID","value":"<clientId printed by setup-github-oidc.ps1>"}'
+```
 
 ### Notes
 
@@ -433,6 +457,11 @@ summary (ids + counts) so a failing CI run is readable without extra digging.
 └── publish.yml                     # build → publish (OIDC) → live smoke test
 scripts/
 └── smoke-test.sh                   # end-to-end check: correlation id round trip + summary invariant
+infra/
+├── main.bicep / main.bicepparam    # infrastructure: Flex Consumption app, DTS scheduler, App Insights
+├── deploy.ps1                      # provision the infrastructure (Az PowerShell, dot-source it)
+├── setup-github-oidc.ps1           # CI identity + federated credential + role assignments
+└── deployment-outputs.json         # names produced by a deployment (function app, DTS endpoint…)
 src/ProductIntegration/
 ├── Program.cs                      # host setup, DI, App Insights wiring, correlation middleware
 ├── Correlation.cs                  # resolve/propagate correlation ids (x-correlation-id, traceparent)
@@ -476,3 +505,17 @@ src/ProductIntegration/
   orchestrator (e.g. `Guid.NewGuid()`) breaks determinism: on replay the id would change,
   so logs from the same run would no longer match. The orchestrator takes it from its
   input and falls back to `context.InstanceId`.
+- Pushing a file under `.github/workflows/` needs a token with the **`workflow`** scope;
+  a `repo`-only PAT is rejected with *“refusing to allow a Personal Access Token to create
+  or update workflow … without `workflow` scope”*.
+- Shell scripts need LF line endings or `bash` on the runner fails on `\r` — `.gitattributes`
+  pins `*.sh text eol=lf` so a Windows checkout cannot break the workflow.
+- ARM gotchas hit while writing `infra/setup-github-oidc.ps1`:
+  - `roleDefinitionId` in a role-assignment PUT must be the **full role-definition resource
+    id**; a bare GUID fails with `BadRequestFormat` / `InvalidResourceType`.
+  - a federated identity credential accepts **exactly one** audience
+    (`InvalidFederatedIdentityCredentialsAudienceLength`) — use `api://AzureADTokenExchange`,
+    which is what `azure/login` asks for (the workflow pins it explicitly).
+  - `2023-01-01` is not a valid api-version for `userAssignedIdentities` (`2023-01-31` is).
+  - in a PowerShell double-quoted string `$var?api-version=…` silently mangles the variable
+    name — write `${var}?api-version=…`.
