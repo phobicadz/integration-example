@@ -1,0 +1,333 @@
+# Product Import Integration — Durable Functions Demo
+
+A small but complete **integration** built with Azure Durable Functions (.NET isolated worker):
+
+```
+POST /api/products/import
+        │
+        ▼
+┌───────────────────────────┐
+│ ImportTrigger (HTTP)      │  starts an orchestration, returns 202 + status URL
+└───────────┬───────────────┘
+            ▼
+┌───────────────────────────────────────┐
+│ ProductImportOrchestrator             │  the "brain": deterministic workflow
+│  1. call FetchProducts (with retry)   │
+│  2. fan-out per item (batches of 5)   │
+│  3. aggregate a summary               │
+└───────┬───────────────────────┬───────┘
+        ▼                       ▼
+┌───────────────────┐   ┌──────────────────────────┐
+│ FetchProducts     │   │ ProcessAndPostProduct     │
+│ activity          │   │ activity                  │
+│ (mock source API, │   │ validate → transform →    │
+│  15% flaky)       │   │ post to mock destination  │
+└───────────────────┘   └──────────────────────────┘
+                                │
+                                ▼
+                        MockDestinationStore
+                        (GET /api/products/destination to inspect)
+```
+
+## Running it locally
+
+1. **Start Azurite** (the local Azure Storage emulator — the Functions runtime itself needs
+   a storage backend; only *orchestration state* has moved to DTS, see the DTS section below):
+   ```powershell
+   npm install -g azurite   # one-time
+   azurite --silent --location .azurite
+   ```
+2. **Start the Durable Task Scheduler emulator** (orchestration state backend + dashboard):
+   ```powershell
+   docker run -d --name dts-emulator -p 8080:8080 -p 8082:8082 `
+     -e DTS_TASK_HUB_NAMES=productimport,default `
+     mcr.microsoft.com/dts/dts-emulator:latest
+   ```
+   Dashboard: http://localhost:8082 — gRPC scheduler: http://localhost:8080.
+3. **Start the Functions host**:
+   ```powershell
+   cd src/ProductIntegration
+   func start --port 7071
+   ```
+4. **Kick off an import run** (async HTTP pattern — the run may take seconds/minutes,
+   so the API accepts the work and hands you a status URL):
+   ```powershell
+   Invoke-WebRequest -Uri http://localhost:7071/api/products/import -Method Post `
+     -ContentType 'application/json' -Body '{"category":null}'
+   # → 202 Accepted, body contains runId + statusUrl, header Retry-After: 5
+   ```
+5. **Poll the status endpoint** until `runtimeStatus` is `Completed` / `Failed`:
+   ```powershell
+   Invoke-WebRequest http://localhost:7071/api/products/import/<runId>/status
+   ```
+6. **Inspect what landed at the destination**:
+   ```powershell
+   Invoke-WebRequest http://localhost:7071/api/products/destination
+   ```
+
+Expected happy path: the mock source has 14 products, 5 of them deliberately dirty
+(empty name, negative price, zero stock, missing SKU, multiple issues at once)
+→ first run shows `posted: 9, skipped: 0, rejected: 5`.
+
+**Run it a second time** (same host process): every item's version is unchanged, so the
+destination's version guard rejects them all → `posted: 0, skipped: 9, rejected: 5`.
+That second run is the idempotency demo — see below.
+
+## How an integration like this should work (the patterns)
+
+### 1. Trigger → Orchestrator → Activities
+- The **HTTP trigger** does almost nothing: it starts an orchestration and returns
+  `202 Accepted` with a `Location`/status URL and `Retry-After`. Long-running work
+  never blocks an HTTP request.
+- The **orchestrator** (`ProductImportOrchestrator`) is the workflow. It is *replayed*
+  after every await, so it must be **deterministic**:
+  - no direct I/O, no `DateTime.Now`, no `Guid.NewGuid()`, no random numbers
+    (use `context.CurrentUtcDateTime` and pass IDs in from the trigger instead),
+  - no `Task.Delay` / `Task.WhenAny` on non-Durable tasks (use `context.CreateTimer`),
+  - code must produce the same sequence of scheduled tasks on every replay.
+- **Activities** are where side effects live (HTTP calls, DB writes). They run once
+  per attempt and are the unit that retries apply to. Make them **idempotent** —
+  a retry re-runs the whole activity (our destination upsert is keyed by SKU, so
+  re-posting the same product is safe).
+
+### 2. Retries and failure isolation
+Retries are declared **at the orchestrator's call site**, not on the activity:
+
+```csharp
+static readonly TaskOptions SourceRetryOptions = TaskOptions.FromRetryPolicy(
+    new RetryPolicy(
+        maxNumberOfAttempts: 4,
+        firstRetryInterval: TimeSpan.FromSeconds(2),
+        backoffCoefficient: 2.0,
+        maxRetryInterval: TimeSpan.FromSeconds(30)));
+
+await context.CallActivityAsync<List<Product>>(nameof(FetchProducts), request, SourceRetryOptions);
+```
+
+The deliberate design split:
+- **Transport failures throw** → the retry policy retries them with exponential backoff.
+- **Validation failures return a "rejected" outcome** (no throw) → not retried, recorded.
+- The orchestrator wraps each item in `try/catch (TaskFailedException)` so **one bad
+  item can't kill the whole run**; after retries are exhausted the failure is recorded
+  in the summary and the run continues. `TaskFailedException.FailureDetails` carries
+  the error type/message/stack — not `InnerException`.
+
+### 3. Fan-out with batching
+8 (or 8,000) items are fanned out in **batches of 5** with `Task.WhenAll`. Unbounded
+fan-out can overwhelm downstream systems and the Functions host; batching is the
+throttle. Each item's outcome is aggregated into an `IntegrationSummary`
+(`totalFetched / posted / rejected / failed`) — the run reports *what actually happened*,
+not just "it finished".
+
+### 4. Mocked endpoints = swap points
+`MockSourceCatalog` and `MockDestinationStore` are singletons behind tiny abstractions.
+In a real integration you'd replace them with an HTTP client (source) and a queue/API/DB
+write (destination) — the orchestrator, retries, monitoring, and failure semantics stay
+identical. That's the point: the *integration skeleton* is what you learn, not the mocks.
+
+### 5. Idempotency and versioning (the `skipped` outcome)
+
+Retries and replays mean the same item **will** be delivered more than once. The defense is
+a **version supplied by the source**, carried unchanged through the whole pipeline:
+
+```
+Product.Version (source, monotonic) ──► ProcessedProduct.Version (copied verbatim)
+                                   ──► MockDestinationStore.Upsert (compare-and-swap)
+```
+
+- `MockDestinationStore.Upsert` uses `ConcurrentDictionary.AddOrUpdate` as a CAS:
+  the incoming item wins **only if** `item.Version > current.Version`; otherwise the
+  stored item is kept and the upsert reports `SkippedStale`.
+- The activity logs `SKIPPED {Sku} v{n}: destination already current` and returns
+  `ItemOutcome { Success = true, Reason = "skipped" }` — a stale duplicate is a
+  *successful no-op*, not a failure.
+- The orchestrator aggregates `Posted / Skipped / Rejected / Failed` with the invariant
+  `Posted + Skipped + Rejected + Failed == TotalFetched`, so duplicate suppression is
+  *visible* in the summary instead of hidden.
+
+**Why the version must come from the source:** a locally generated value like
+`ProcessedAtUtc` would be *newer* on every retry, so the guard would accept the duplicate
+and a late/out-of-order write would win. Only the source knows which revision is newer.
+
+Real-world equivalents of the same guard:
+
+| System | Equivalent mechanism |
+|---|---|
+| Azure Cosmos DB | `_etag` + `If-Match` (optimistic concurrency) |
+| SQL / relational | `UPDATE ... WHERE version < @version` |
+| Service Bus / queues | duplicate detection via `MessageId` |
+| HTTP APIs | `If-Match` / `ETag`, or an idempotency-key header |
+| Event-sourced systems | sequence number / vector clock per aggregate |
+
+## Monitoring this integration
+
+| Signal | Where | What it tells you |
+|---|---|---|
+| Run status | `GET /api/products/import/{id}/status` | `runtimeStatus` (Running/Completed/Failed/Terminated), created/updated timestamps, failure details, final summary |
+| Audit trail | same endpoint, `history` field (`client.GetOrchestrationHistoryAsync`) | every event: each task scheduled/completed, retries, timers — replay this and you can reconstruct exactly how the run progressed |
+| Destination check | `GET /api/products/destination` | what actually arrived downstream (the integration's real output) |
+| Structured logs | `ILogger` in activities/trigger → console locally, **Application Insights** in prod (`AddApplicationInsightsTelemetryWorkerService().ConfigureFunctionsApplicationInsights()` is already wired in `Program.cs`) | per-item POSTED/REJECTED/FAILED lines, correlation via `[run:{RunId}]` in every message |
+| Instance inventory | `client.GetAllInstancesAsync(new OrchestrationQuery { ... })` | list/paginate all runs by status or time window — build a dashboard endpoint from this |
+| **DTS dashboard** | http://localhost:8082 (emulator) or the task hub's dashboard URL in Azure | live orchestration inventory per task hub: running/completed/failed counts, per-instance drill-down into event history — no code required |
+| Production dashboards | Application Insights (Functions app maps, end-to-end transactions) and **Durable Task Scheduler** (for the DTS backend) | orchestration-level metrics, failure rates, alerting |
+
+Monitoring rules of thumb this demo encodes:
+- **Every run has an ID, and every log line carries it.** Correlation is the whole game.
+- **Status polling with `Retry-After`** is the client-facing monitoring contract for async integrations.
+- **A run that "completed" is not necessarily a successful integration** — the summary
+  distinguishes posted/rejected/failed so partial success is visible, not hidden.
+- The **orchestration history is your replayable audit log** — far more useful than
+  scattered logs when someone asks "why did this item get rejected?".
+
+## Durable Task Scheduler (this project's state backend)
+
+This project runs its orchestration state on **Durable Task Scheduler (DTS)** instead of the
+classic storage-provider backends. Locally that means the official DTS emulator container;
+in Azure it is a real resource (`Microsoft.DurableTask/schedulers` + task hubs).
+
+What changed in the code: **nothing.** DTS is a backend swap, not an API change —
+`TaskOrchestrationContext`, `DurableTaskClient`, `GetInstanceAsync`, and
+`GetOrchestrationHistoryAsync` all work identically. The swap lives entirely in config:
+
+- `ProductIntegration.csproj` — `Microsoft.Azure.Functions.Worker.Extensions.DurableTask.AzureManaged`
+- `host.json` —
+  ```json
+  "extensions": {
+    "durableTask": {
+      "storageProvider": {
+        "type": "azureManaged",
+        "connectionStringName": "DTS_CONNECTION_STRING"
+      },
+      "hubName": "%TASKHUB_NAME%"
+    }
+  }
+  ```
+- `local.settings.json` —
+  ```json
+  "DTS_CONNECTION_STRING": "Endpoint=http://localhost:8080;Authentication=None",
+  "TASKHUB_NAME": "productimport"
+  ```
+  (`Authentication=None` is emulator-only. In Azure:
+  `Endpoint=https://{scheduler}.{region}.durabletask.io;Authentication=DefaultAzure`, a
+  managed identity, and the **Durable Task Data Contributor** RBAC role on the task hub —
+  plus **Durable Task Dashboard Viewer** for dashboard access.)
+
+Caveats and notes:
+
+- **Azurite is still required.** `AzureWebJobsStorage` is used by the Functions runtime
+  itself (triggers, locks, internal state). Only orchestration state moved to DTS.
+- The emulator's state is **in-memory**: restarting the container loses all runs. In Azure,
+  state persists per the task hub's retention/autopurge policies.
+- The dashboard (port 8082 locally) complements the `/status` endpoint rather than replacing
+  it: the endpoint is the *client-facing contract* your callers poll; the dashboard is the
+  *operator's view* — instance counts by status, worker counts, and event-history drill-down
+  per instance, without writing any monitoring code.
+- One run of `func start` keeps the in-memory `MockDestinationStore` alive; the
+  `skipped: 9` demo only works when both runs happen in the **same host process**. DTS
+  state itself survives `func start` restarts (until the emulator container restarts).
+
+## Deploy to Azure (verified working)
+
+The infrastructure lives in `infra/` and is deployed with Az PowerShell (no az CLI or azd needed):
+
+```powershell
+# 1. Provision the infrastructure (builds Bicep, ensures the RG, validates, deploys,
+#    and writes the outputs to infra/deployment-outputs.json)
+Import-Module Az.Accounts, Az.Resources
+Connect-AzAccount
+. ./infra/deploy.ps1
+
+# 2. Publish the Functions code
+func azure functionapp publish <functionAppName>   # name printed by deploy.ps1
+```
+
+What `infra/main.bicep` provisions (all in one region, e.g. `northeurope`):
+
+| Resource | Purpose |
+|---|---|
+| Function App (**Flex Consumption**, Linux, `dotnet-isolated 8.0`) | runs the 6 functions |
+| Storage account + `app-package-*` blob container | Flex deployment package + Functions runtime state |
+| Durable Task Scheduler + task hub (`Microsoft.DurableTask/schedulers@2025-11-01`) | orchestration state backend (`azureManaged`) |
+| User-assigned managed identity + 4 RBAC role assignments | keyless auth: Blob Data Owner, Queue/Table Data Contributor, **Durable Task Data Contributor** (`0ad04412-c4d5-4796-b79c-f76d14c8d402`) |
+| Log Analytics + App Insights | monitoring |
+
+Key facts learned while getting this to deploy (all reflected in the template):
+
+- **Region:** West Europe is closed to new customers on this subscription → use `northeurope`.
+- **App Insights:** API version `2022-06-15` is not registered in `northeurope`; the template
+  uses `2020-02-02`. `diagnosticSourceSettings` has no ARM API at all — enable Durable
+  tracking in the portal (App Insights → Diagnostic Sources) instead.
+- **Flex Consumption** replaces the retired Linux Consumption plan (a fresh subscription has
+  0 App Service cores quota for B1). On Flex, do **not** set the classic app settings
+  (`FUNCTIONS_WORKER_RUNTIME`, `linuxFxVersion`, `WEBSITE_RUN_FROM_PACKAGE`, …) — runtime and
+  scaling live in `functionAppConfig` instead.
+- **Workload identity:** a *user-assigned* identity is created **before** the Function App so
+  the role assignments can grant it access to the deployment blob container (system-assigned
+  would be a chicken-and-egg dependency). Storage is then keyless via
+  `AzureWebJobsStorage__accountName/__credential/__clientId`.
+- **DTS connection string** (set automatically by the template):
+  `Endpoint=https://<scheduler>.<region>.durabletask.io;Authentication=ManagedIdentity;ClientID=<identity clientId>`.
+  Note Azure shortens the scheduler name inside the endpoint host.
+- **Role GUIDs** must be the real built-in ids (e.g. Storage Blob Data Owner
+  `b7e6dc6d-f1e8-4753-8033-0f276bb0955b`) — a wrong GUID fails with `RoleDefinitionDoesNotExist`.
+
+Smoke test after publishing:
+
+```powershell
+$r = Invoke-RestMethod "https://<app>.azurewebsites.net/api/products/import" -Method Post -ContentType 'application/json'
+Invoke-RestMethod "https://<app>.azurewebsites.net$($r.statusUrl)"   # poll until runtimeStatus = Completed
+```
+
+First run: `posted 9 / skipped 0 / rejected 5`. Repeat runs on the same warm instance:
+`posted 0 / skipped 9` — the version guard live in production.
+
+> Caveat: `GET /api/products/destination` reads the **in-memory** `MockDestinationStore`, which
+> is per-instance. Flex scales out, so the GET may land on a different instance and show 0
+> items even after a successful run. The orchestration itself (and its version guard) is fully
+> durable in DTS; only the mock destination view is instance-local. Swap
+> `MockDestinationStore` for a real store (Cosmos, SQL, …) to make the destination view global.
+
+Teardown: `Remove-AzResourceGroup -Name rg-integration-example -Force`.
+Cost for this demo: Flex Consumption free grants (1M executions / 400k GB-s per month) plus
+DTS Consumption SKU (pay-per-action, no base fee) — effectively near zero.
+
+## Project layout
+
+```
+src/ProductIntegration/
+├── Program.cs                      # host setup, DI, App Insights wiring
+├── host.json                       # Functions host config + azureManaged (DTS) backend
+├── local.settings.json             # Azurite + DTS_CONNECTION_STRING + TASKHUB_NAME
+├── Models/                         # Product, ProcessedProduct (with Version), request/summary DTOs
+├── Functions/
+│   ├── ImportTrigger.cs            # POST /api/products/import  (202 + status URL)
+│   ├── ImportStatus.cs             # GET  status + history       (monitoring)
+│   ├── ProductImportOrchestrator.cs# the workflow + retry policies + fan-out batching
+│   ├── Activities.cs               # FetchProducts / ProcessAndPostProduct (side effects)
+│   └── DestinationInspector.cs     # GET  /api/products/destination
+└── Services/
+    ├── MockSourceCatalog.cs        # 14 seeded products (5 dirty, source versions), 15% transient failures
+    └── MockDestinationStore.cs     # in-memory destination keyed by SKU (CAS version guard)
+```
+
+## Notes / gotchas hit while building this
+
+- The **isolated worker model** uses `Microsoft.DurableTask.*` APIs
+  (`TaskOrchestrationContext`, `TaskOptions.FromRetryPolicy`), *not* the older in-process
+  `IDurableOrchestrationContext` / `[RetryOptions]` attribute. There is no
+  `context.RetryOptions` and no `metadata.Output` — use `ReadOutputAs<T>()` /
+  `SerializedOutput` and `metadata.FailureDetails`.
+- `host.json` has **no `inMemory` option** — orchestration state always goes to the
+  storage backend (`AzureWebJobsStorage`). Locally that's Azurite; in production,
+  Azure Storage or Durable Task Scheduler. That backend is what makes the workflow
+  *durable* across restarts and scale-out.
+- Package versions must line up: Worker SDK 2.x + Worker 2.x + DurableTask extension 1.19.x
+  (mixing Worker 1.x with the current Functions host causes `MissingMethodException` at
+  invocation time). The DTS backend is a *separate* package
+  (`...Extensions.DurableTask.AzureManaged`) and must match the DurableTask extension line.
+- With pinned NuGet packages in an isolated project, **remove the `extensionBundle` block
+  from `host.json`** — the bundle can resolve conflicting versions of the same extensions.
+- `func start` works, but the CLI itself warns that `dotnet run` is the more reliable way
+  to start an isolated project (it builds first and runs from the right output directory).
+- The status response's run id field is `runId` (not `id`) — poll
+  `/api/products/import/{runId}/status`.

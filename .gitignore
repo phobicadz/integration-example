@@ -1,0 +1,36 @@
+# .NET / C#
+bin/
+obj/
+*.user
+*.suo
+.vs/
+artifacts/
+publish/
+TestResults/
+*.binlog
+.nuget/
+
+# Azure Functions
+local.settings.json
+
+# Azurite (local storage emulator)
+.azurite/
+__blobstorage__/
+__queuestorage__/
+__azurite_db_*.json
+
+# Bicep / deployment artifacts
+infra/main.json
+infra/main.deploy.json
+infra/deployment-outputs.json
+
+# Environment & secrets
+.env
+.env.local
+*.pfx
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
