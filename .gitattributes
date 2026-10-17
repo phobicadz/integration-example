@@ -1,0 +1,11 @@
+# Keep shell scripts runnable on Linux runners (bash fails on CRLF).
+# Scoped deliberately narrow: no blanket `* text=auto` so existing files are not
+# re-normalized into a huge whitespace-only diff.
+*.sh text eol=lf
+
+# Never treat these as text (git would try to diff/normalize them).
+*.dll binary
+*.exe binary
+*.zip binary
+*.png binary
+*.jpg binary

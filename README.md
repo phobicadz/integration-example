@@ -337,13 +337,102 @@ First run: `posted 9 / skipped 0 / rejected 5`. Repeat runs on the same warm ins
 > durable in DTS; only the mock destination view is instance-local. Swap
 > `MockDestinationStore` for a real store (Cosmos, SQL, …) to make the destination view global.
 
-Teardown: `Remove-AzResourceGroup -Name rg-integration-example -Force`.
+Teardown: `Remove-AzResourceGroup -Name Fanny -Force` (that is the group `infra/deploy.ps1`
+creates; `infra/main.bicepparam` and `deploy.ps1` are the source of truth for the name).
 Cost for this demo: Flex Consumption free grants (1M executions / 400k GB-s per month) plus
 DTS Consumption SKU (pay-per-action, no base fee) — effectively near zero.
+
+## Publish from GitHub Actions
+
+`.github/workflows/publish.yml` publishes the **code** (it does not provision infra — that
+stays `infra/deploy.ps1`, which is a one-off and needs an interactive login).
+
+| Trigger | What runs |
+|---|---|
+| push to `main` touching `src/**`, `scripts/smoke-test.sh`, or the workflow itself | `build → deploy → verify` |
+| `workflow_dispatch` (Actions → Publish to Azure → Run workflow) | same, with an optional `functionAppName` input to publish somewhere else |
+
+| Job | What it does |
+|---|---|
+| `build` | `dotnet publish -c Release` of `src/ProductIntegration` (a build failure never reaches Azure), uploaded as an artifact |
+| `deploy` | `azure/login@v3` (OIDC) → `Azure/functions-action@v1` → one-deploy to the **Flex Consumption** app. `sku` is not set: with OIDC+RBAC the action resolves the plan itself, and Flex must not get the classic app settings |
+| `verify` | runs `scripts/smoke-test.sh` against the live app: starts a run with an `x-correlation-id`, requires that id back in the response header, in the 202 body and in the finished run summary, then asserts `posted + skipped + rejected + failed == totalFetched` |
+
+### One-time setup (OIDC — no secrets to rotate)
+
+Run this in the Azure Cloud Shell (this machine has no `az` CLI) or click the equivalents in
+the portal:
+
+```bash
+SUB=e8f2b11f-4962-492a-afe2-8c465a22996f     # your subscription
+RG=Fanny                                      # the resource group deploy.ps1 created
+APP=prodint-fn-wrkc7gwtmfswq                 # from infra/deployment-outputs.json
+
+# 1. a user-assigned managed identity for CI
+az identity create -g $RG -n id-integration-example-ci -l northeurope
+CI_ID=$(az identity show -g $RG -n id-integration-example-ci --query clientId -o tsv)
+PRINCIPAL=$(az identity show -g $RG -n id-integration-example-ci --query principalId -o tsv)
+
+# 2. trust THIS GitHub repo (permissive: any ref). Narrow it later to
+#    "repo:phobicadz/integration-example:ref:refs/heads/main" if you want.
+az identity federated-credential create -g $RG --identity-name id-integration-example-ci \
+  -n github-integration-example \
+  --issuer "https://token.actions.githubusercontent.com" \
+  --subject "repo:phobicadz/integration-example:*"
+
+# 3. permissions: Contributor on the group (app + its storage), Website Contributor on the app
+APP_ID=$(az functionapp show -n $APP -g $RG --query id -o tsv)
+az role assignment create --role Contributor           --assignee-object-id $PRINCIPAL \
+  --assignee-principal-type ServicePrincipal --scope "/subscriptions/$SUB/resourceGroups/$RG"
+az role assignment create --role "Website Contributor" --assignee-object-id $PRINCIPAL \
+  --assignee-principal-type ServicePrincipal --scope "$APP_ID"
+```
+
+Then in GitHub: **Settings → Secrets and variables → Actions → Variables** (Create a
+repository variable) and add:
+
+| Variable | Value |
+|---|---|
+| `AZURE_CLIENT_ID` | `$CI_ID` above — the identity's **clientId**, not its principalId |
+| `AZURE_TENANT_ID` | `az account show --query tenantId -o tsv` |
+| `AZURE_SUBSCRIPTION_ID` | `$SUB` |
+| `FUNCTIONAPP_NAME` | `$APP` (otherwise the workflow discovers the only function app in `RESOURCE_GROUP`) |
+| `RESOURCE_GROUP` | optional; only used by that discovery fallback |
+
+If a variable is missing, the `deploy` job stops at its **Preflight** step naming exactly
+which one — that is the expected outcome of the *first* run right after pushing this
+workflow, before the variables exist.
+
+### Notes
+
+- `local.settings.json` is gitignored on purpose: the deployed app takes its settings from the
+  Bicep template (`DTS_CONNECTION_STRING`, `TASKHUB_NAME`, keyless storage), not from the repo.
+- `verify` asserts the **invariant**, not exact counts: a fresh instance posts 9 / rejects 5, a
+  warm repeat is suppressed to `posted 0 / skipped 9` by the version guard. Both pass.
+- `GET /api/products/destination` is deliberately not asserted — the mock store is in-memory
+  and per-instance (caveat above).
+- The manual path still works for a one-off: `func azure functionapp publish <app>`.
+
+### Running the smoke test by hand
+
+`scripts/smoke-test.sh` is exactly what the `verify` job runs, usable locally too:
+
+```bash
+./scripts/smoke-test.sh http://localhost:7071                        # needs func start + Azurite
+./scripts/smoke-test.sh https://prodint-fn-wrkc7gwtmfswq.azurewebsites.net "my-run-42"
+POLL_MAX_ATTEMPTS=60 ./scripts/smoke-test.sh https://<app>.azurewebsites.net   # cold-start allowance
+```
+
+It needs `curl` and `jq`, exits non-zero at the first broken assumption, and prints the run
+summary (ids + counts) so a failing CI run is readable without extra digging.
 
 ## Project layout
 
 ```
+.github/workflows/
+└── publish.yml                     # build → publish (OIDC) → live smoke test
+scripts/
+└── smoke-test.sh                   # end-to-end check: correlation id round trip + summary invariant
 src/ProductIntegration/
 ├── Program.cs                      # host setup, DI, App Insights wiring, correlation middleware
 ├── Correlation.cs                  # resolve/propagate correlation ids (x-correlation-id, traceparent)
