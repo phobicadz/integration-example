@@ -514,6 +514,13 @@ src/ProductIntegration/
   or update workflow … without `workflow` scope”*.
 - Shell scripts need LF line endings or `bash` on the runner fails on `\r` — `.gitattributes`
   pins `*.sh text eol=lf` so a Windows checkout cannot break the workflow.
+- OIDC subject matching is exact. If `azure/login` fails with
+  `AADSTS700213: No matching federated identity record found for presented assertion
+  subject …`, read the **presented** subject out of the action's own log (it prints
+  “subject claim - …”) and register that spelling. On this repo GitHub presented
+  `repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main` — ids
+  embedded — so `setup-github-oidc.ps1` trusts both forms (an identity may hold several
+  federated credentials; each holds exactly one audience).
 - ARM gotchas hit while writing `infra/setup-github-oidc.ps1`:
   - `roleDefinitionId` in a role-assignment PUT must be the **full role-definition resource
     id**; a bare GUID fails with `BadRequestFormat` / `InvalidResourceType`.

@@ -28,9 +28,17 @@ Import-Module Az.Accounts -ErrorAction Stop
 # --- configuration (mirrors infra/deploy.ps1 + infra/deployment-outputs.json) ---
 $rgName        = 'Fanny'
 $identityName  = 'id-integration-example-ci'
-$fedCredName   = 'github-integration-example'
 $githubRepo    = 'phobicadz/integration-example'
-$githubSubject = "repo:${githubRepo}:*"          # any branch/ref; narrow later to :ref:refs/heads/main
+# The subject claim GitHub actually presents is what has to match. azure/login prints it
+# in its failure line (AADSTS700213 'No matching federated identity record found for
+# presented assertion subject …'), and on this repo it came out as:
+#   repo:phobicadz@1702616/integration-example@1423810732:ref:refs/heads/main
+# i.e. with the owner and repository ids embedded. Both spellings are registered below so
+# either form works; delete the one that never matches once you have a green run.
+$githubSubjects = @(
+    "repo:${githubRepo}:*",
+    'repo:phobicadz@1702616/integration-example@1423810732:*'
+)
 $githubIssuer  = 'https://token.actions.githubusercontent.com'
 $functionAppName = 'prodint-fn-wrkc7gwtmfswq'
 
@@ -76,22 +84,45 @@ Write-Host "`n[1/3] user-assigned identity '$identityName'"
 Write-Host "      clientId    : $clientId"
 Write-Host "      principalId : $principalId"
 
-# --- 2. federated identity credential (trust GitHub's OIDC token) --------------------
-# ARM accepts EXACTLY ONE audience (InvalidFederatedIdentityCredentialsAudienceLength).
-# 'api://AzureADTokenExchange' is the audience azure/login requests by default; if you
-# ever pass a custom `audience` to azure/login, this value has to match it.
-$fedCredId = "$identityId/federatedIdentityCredentials/$fedCredName"
-$fedResp = Invoke-AzRestMethod -Path "${fedCredId}?api-version=$apiIdentity" -Method PUT -Payload (@{
-    properties = @{
-        issuer   = $githubIssuer
-        subject  = $githubSubject
-        audiences = @('api://AzureADTokenExchange')
+# --- 2. federated identity credentials (trust GitHub's OIDC token) -------------------
+# ARM accepts EXACTLY ONE audience per credential (InvalidFederatedIdentityCredentialsAudienceLength).
+# 'api://AzureADTokenExchange' is the audience azure/login requests (the workflow pins it
+# explicitly); if you ever change that `audience`, these credentials have to match it.
+# An identity may hold several federated credentials, which is how the two subject
+# spellings above are both trusted.
+Write-Host "`n[2/3] federated credentials on '$identityName'"
+# Idempotency: (issuer, subject) is unique per identity, so reuse the existing credential
+# name for a subject that is already trusted - PUT-ing a different name for the same pair
+# fails with 409 Conflict.
+$existingCreds = @()
+$list = Invoke-AzRestMethod -Path "$identityId/federatedIdentityCredentials?api-version=$apiIdentity" -Method GET
+if ($list.StatusCode -eq 200) { $existingCreds = ($list.Content | ConvertFrom-Json).value }
+
+foreach ($subject in $githubSubjects) {
+    $match = $existingCreds | Where-Object {
+        $_.properties.subject -eq $subject -and $_.properties.issuer -eq $githubIssuer
+    } | Select-Object -First 1
+
+    if ($match) {
+        $credName = $match.name
+    } else {
+        # New names: URL-safe, derived from the subject so they stay recognisable.
+        $credName = $subject -replace '[^A-Za-z0-9_.-]', '-'
+        if ($credName.Length -gt 80) { $credName = $credName.Substring(0, 80) }
     }
-} | ConvertTo-Json -Depth 6)
-if ($fedResp.StatusCode -notin 200, 201) { throw "federated credential create failed (HTTP $($fedResp.StatusCode)): $($fedResp.Content)" }
-Write-Host "`n[2/3] federated credential '$fedCredName'"
-Write-Host "      issuer  : $githubIssuer"
-Write-Host "      subject : $githubSubject"
+    $fedCredId = "$identityId/federatedIdentityCredentials/$credName"
+    $fedResp = Invoke-AzRestMethod -Path "${fedCredId}?api-version=$apiIdentity" -Method PUT -Payload (@{
+        properties = @{
+            issuer    = $githubIssuer
+            subject   = $subject
+            audiences = @('api://AzureADTokenExchange')
+        }
+    } | ConvertTo-Json -Depth 6)
+    if ($fedResp.StatusCode -notin 200, 201) { throw "federated credential '$credName' failed (HTTP $($fedResp.StatusCode)): $($fedResp.Content)" }
+    Write-Host "      subject : $subject"
+    Write-Host "      name    : $credName"
+}
+Write-Host "      issuer  : $githubIssuer (audience: api://AzureADTokenExchange)"
 
 # --- 3. role assignments --------------------------------------------------------------
 $app = Invoke-AzRestMethod -Path "$rgId/providers/Microsoft.Web/sites/${functionAppName}?api-version=$apiWeb" -Method GET
